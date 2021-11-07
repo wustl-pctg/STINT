@@ -1,0 +1,205 @@
+#include <inttypes.h>
+ 
+#include "print_addr.h"
+#include "mem_access.h"
+
+// Check races on memory represented by this mem list with this read access
+// Once done checking, update the mem list with this new read access
+int
+MemAccessList_t::check_races_and_update_with_read(uint64_t inst_addr, 
+                              uint64_t addr, size_t mem_size,
+                              om_node *curr_estrand, om_node *curr_hstrand) {
+
+  DBG_TRACE(DEBUG_MEMORY, "check race w/ read addr %lx and size %lu.\n",
+            addr, mem_size);
+  om_assert( addr >= start_addr && 
+                       (addr+mem_size) <= (start_addr+MAX_GRAIN_SIZE) );
+
+  if (addr - start_addr + mem_size > MAX_GRAIN_SIZE) {
+	mem_size = MAX_GRAIN_SIZE + start_addr - addr;;
+  }
+  // check races with the writers
+  // start (inclusive) index covered by this mem access;                        
+  const int start = ADDR_TO_MEM_INDEX(addr);
+  const int grains = SIZE_TO_NUM_GRAINS(mem_size);
+  om_assert(start >= 0 && start < NUM_SLOTS && (start + grains) <= NUM_SLOTS);
+  DBG_TRACE(DEBUG_MEMORY, "Read has start %d and grains %d.\n", start, grains);
+
+  // walk through the indices that this memory access cover to check races
+  // against any writer found within this range 
+  for(int i = start; i < (start + grains); i++) {
+    MemAccess_t *writer = writers[i]; // can be NULL
+    if( writer && writer->races_with(curr_estrand, curr_hstrand) ) {
+      report_race(writer->rip, inst_addr, start_addr+i, WR_RACE);
+    }
+  }
+
+  // update the left-most reader list with this mem access
+  for(int i = start; i < (start + grains); i++) {
+    MemAccess_t *reader = lreaders[i];
+    if(reader == NULL) {
+      reader = new MemAccess_t(curr_estrand, curr_hstrand, inst_addr);
+      //pthread_spin_lock(&lreader_lock);
+      if (lreaders[i] == NULL) {
+        lreaders[i] = reader;
+      }
+      //pthread_spin_unlock(&lreader_lock);
+      if (reader == lreaders[i]) continue;
+      else {
+        delete reader;
+        reader = lreaders[i];
+      }
+    }
+    om_assert(reader != NULL);
+
+    // potentially update the left-most reader; replace it if 
+    // - the new reader is to the left of the old lreader 
+    //   (i.e., comes first in serially execution)  OR
+    // - there is a path from old lreader to this reader
+    bool is_leftmost;
+#if STATS > 0
+    __sync_fetch_and_add(&g_num_queries, 1);
+#endif
+    QUERY_START;
+    RDTOOL_INTERVAL_BEGIN(QUERY);
+    is_leftmost = om_precedes(curr_estrand, reader->estrand) ||
+      om_precedes(reader->hstrand, curr_hstrand);
+    RDTOOL_INTERVAL_END(QUERY);
+    QUERY_END;
+    
+    if(is_leftmost) {
+      //pthread_spin_lock(&lreader_lock);
+      lreaders[i]->update_acc_info(curr_estrand, curr_hstrand, inst_addr);
+      //pthread_spin_unlock(&lreader_lock);
+    }
+  }
+
+
+   return mem_size;
+}
+
+// Check races on memory represented by this mem list with this write access
+// Also, update the writers list.  
+// Very similar to check_races_and_update_with_read function above.
+int
+MemAccessList_t::check_races_and_update_with_write(uint64_t inst_addr,
+                                                   uint64_t addr, size_t mem_size,
+                                                   om_node *curr_estrand, om_node *curr_hstrand) {
+
+  DBG_TRACE(DEBUG_MEMORY, "check race w/ write addr %lx and size %lu.\n",
+            addr, mem_size);
+  om_assert( addr >= start_addr && 
+                       (addr+mem_size) <= (start_addr+MAX_GRAIN_SIZE) );
+
+  if (addr - start_addr + mem_size > MAX_GRAIN_SIZE) {
+	mem_size = MAX_GRAIN_SIZE + start_addr - addr;
+  }
+  
+  const int start = ADDR_TO_MEM_INDEX(addr);
+  const int grains = SIZE_TO_NUM_GRAINS(mem_size);
+  om_assert(start >= 0 && start < NUM_SLOTS && (start + grains) <= NUM_SLOTS); 
+  DBG_TRACE(DEBUG_MEMORY, "Write has start %d and grains %d.\n", start, grains);
+
+  // now traverse through the writers list to both report race and update
+  for(int i = start; i < (start + grains); i++) {
+    MemAccess_t *writer = writers[i];
+    if(writer == NULL) {
+      writer = new MemAccess_t(curr_estrand, curr_hstrand, inst_addr);
+      //pthread_spin_lock(&writer_lock);
+      if(writers[i] == NULL) {
+        writers[i] = writer;
+      }
+      //pthread_spin_unlock(&writer_lock);
+      if(writer == writers[i]) continue;
+      else { // was NULL but some other logically parallel strand updated it
+          delete writer;
+          writer = writers[i];
+      }
+    }
+    // At this point, someone else may come along and write into writers[i]...
+    // om_assert(writer == writers[i]);
+    om_assert(writer);
+
+    // om_assert(writer->estrand != curr_estrand && 
+    //           writer->hstrand != curr_hstrand);
+
+    // last writer exists; possibly report race and replace it
+    if( writer->races_with(curr_estrand, curr_hstrand) ) { 
+      // report race
+      report_race(writer->rip, inst_addr, start_addr+i, WW_RACE);
+    }
+    //pthread_spin_lock(&writer_lock);
+    // replace the last writer regardless
+    writers[i]->update_acc_info(curr_estrand, curr_hstrand, inst_addr);
+    //pthread_spin_unlock(&writer_lock);
+  }
+
+  // Now we detect races with the lreaders
+  for(int i = start; i < (start + grains); i++) {
+    MemAccess_t *reader = lreaders[i];
+    if( reader && reader->races_with(curr_estrand, curr_hstrand) ) {
+      report_race(reader->rip, inst_addr, start_addr+i, RW_RACE);
+    }
+  }
+
+  return mem_size;
+}
+
+int max_support_size(uint64_t addr, size_t mem_size) {
+  uint64_t start_addr = ALIGN_BY_PREV_MAX_GRAIN_SIZE(addr);
+  return MAX_GRAIN_SIZE + start_addr - addr;
+}
+
+MemAccessList_t::MemAccessList_t(uint64_t addr, bool is_read, 
+                                 om_node *estrand, om_node *hstrand, 
+                                 uint64_t inst_addr, size_t mem_size) 
+  : start_addr( ALIGN_BY_PREV_MAX_GRAIN_SIZE(addr) ) {
+  for(int i=0; i < NUM_SLOTS; i++) {
+    lreaders[i] = writers[i] = NULL;
+    //    lreaders[i] = writers[i] = NULL;
+  }
+
+  const int start = ADDR_TO_MEM_INDEX(addr);
+  const int grains = SIZE_TO_NUM_GRAINS(mem_size);
+  DBG_TRACE(DEBUG_MEMORY, "Mem access has start %d and grains %d.\n", 
+            start, grains);
+  om_assert(start >= 0 && start < NUM_SLOTS && (start + grains) <= NUM_SLOTS);
+
+  // No need to acquire locks yet, since this is a new object and its
+  // reference has not escaped.
+  if(is_read) {
+    for(int i=start; i < (start + grains); i++) {
+      lreaders[i] = new MemAccess_t(estrand, hstrand, inst_addr);
+    }
+  } else {
+    for(int i=start; i < (start + grains); i++) {
+      writers[i] = new MemAccess_t(estrand, hstrand, inst_addr);
+    }
+  }
+
+//  if(pthread_spin_init(&lreader_lock, PTHREAD_PROCESS_PRIVATE) ||  
+//     pthread_spin_init(&rreader_lock, PTHREAD_PROCESS_PRIVATE) ||
+//     pthread_spin_init(&writer_lock, PTHREAD_PROCESS_PRIVATE) ) {
+//    fprintf(stderr, 
+//            "spin_lock initialization for MemAccessList_t failed.  Exit.\n");
+//    exit(1);
+//  }
+}
+
+MemAccessList_t::~MemAccessList_t() {
+  for(int i=0; i < NUM_SLOTS; i++) {
+    if(lreaders[i]) {
+      delete lreaders[i];
+      lreaders[i] = NULL;
+    }
+  }
+  for(int i=0; i < NUM_SLOTS; i++) {
+    if(writers[i]) {
+      delete writers[i];
+      writers[i] = NULL;
+    }
+  }
+//  pthread_spin_destroy(&lreader_lock);
+//  pthread_spin_destroy(&rreader_lock);
+//  pthread_spin_destroy(&writer_lock);
+}
